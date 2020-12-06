@@ -20,7 +20,7 @@ package org.apache.spark.sql.execution.datasources
 import java.util.{Date, UUID}
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileAlreadyExistsException, Path}
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
@@ -39,6 +39,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCo
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
 import org.apache.spark.sql.execution.{ProjectExec, SortExec, SparkPlan, SQLExecution}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.{SerializableConfiguration, Utils}
@@ -132,7 +133,7 @@ object FileFormatWriter extends Logging {
       fileFormat.prepareWrite(sparkSession, job, caseInsensitiveOptions, dataSchema)
 
     val description = new WriteJobDescription(
-      uuid = UUID.randomUUID().toString,
+      uuid = UUID.randomUUID.toString,
       serializableHadoopConf = new SerializableConfiguration(job.getConfiguration),
       outputWriterFactory = outputWriterFactory,
       allColumns = outputSpec.outputColumns,
@@ -162,6 +163,10 @@ object FileFormatWriter extends Logging {
     }
 
     SQLExecution.checkSQLExecutionId(sparkSession)
+
+    // propagate the decription UUID into the jobs, so that committers
+    // get an ID guaranteed to be unique.
+    job.getConfiguration.set("spark.sql.sources.writeJobUUID", description.uuid)
 
     // This call shouldn't be put into the `try` block below because it only initializes and
     // prepares the job, any exception thrown from here shouldn't cause abortJob() to be called.
@@ -277,10 +282,16 @@ object FileFormatWriter extends Logging {
         // If there is an error, abort the task
         dataWriter.abort()
         logError(s"Job $jobId aborted.")
+      }, finallyBlock = {
+        dataWriter.close()
       })
     } catch {
       case e: FetchFailedException =>
         throw e
+      case f: FileAlreadyExistsException if SQLConf.get.fastFailFileFormatOutput =>
+        // If any output file to write already exists, it does not make sense to re-run this task.
+        // We throw the exception and let Executor throw ExceptionFailure to abort the job.
+        throw new TaskOutputFileAlreadyExistException(f)
       case t: Throwable =>
         throw new SparkException("Task failed while writing rows.", t)
     }

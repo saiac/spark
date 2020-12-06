@@ -245,9 +245,47 @@ public class SparkSubmitCommandBuilderSuite extends BaseSuite {
     assertEquals("42", cmd.get(cmd.size() - 1));
   }
 
+  @Test
+  public void testExamplesRunnerPrimaryResource() throws Exception {
+    List<String> sparkSubmitArgs = Arrays.asList(
+            SparkSubmitCommandBuilder.RUN_EXAMPLE,
+            parser.MASTER + "=foo",
+            parser.DEPLOY_MODE + "=cluster",
+            "SparkPi",
+            "100");
+
+    List<String> cmd = newCommandBuilder(sparkSubmitArgs).buildSparkSubmitArgs();
+    assertEquals(SparkSubmitCommandBuilder.EXAMPLE_CLASS_PREFIX + "SparkPi",
+            findArgValue(cmd, parser.CLASS));
+    assertEquals("cluster", findArgValue(cmd, parser.DEPLOY_MODE));
+    String primaryResource = cmd.get(cmd.size() - 2);
+    assertTrue(primaryResource.equals(SparkLauncher.NO_RESOURCE)
+            || new File(primaryResource).getName().startsWith("spark-examples"));
+  }
+
   @Test(expected = IllegalArgumentException.class)
   public void testMissingAppResource() {
     new SparkSubmitCommandBuilder().buildSparkSubmitArgs();
+  }
+
+  @Test
+  public void testIsClientMode() {
+    // Default master is "local[*]"
+    SparkSubmitCommandBuilder builder = newCommandBuilder(Collections.emptyList());
+    assertTrue("By default application run in local mode",
+      builder.isClientMode(Collections.emptyMap()));
+    // --master yarn or it can be any RM
+    List<String> sparkSubmitArgs = Arrays.asList(parser.MASTER, "yarn");
+    builder = newCommandBuilder(sparkSubmitArgs);
+    assertTrue("By default deploy mode is client", builder.isClientMode(Collections.emptyMap()));
+    // --master yarn and set spark.submit.deployMode to client
+    Map<String, String> userProps = new HashMap<>();
+    userProps.put("spark.submit.deployMode", "client");
+    assertTrue(builder.isClientMode(userProps));
+    // --master mesos --deploy-mode cluster
+    sparkSubmitArgs = Arrays.asList(parser.MASTER, "mesos", parser.DEPLOY_MODE, "cluster");
+    builder = newCommandBuilder(sparkSubmitArgs);
+    assertFalse(builder.isClientMode(Collections.emptyMap()));
   }
 
   private void testCmdBuilder(boolean isDriver, boolean useDefaultPropertyFile) throws Exception {

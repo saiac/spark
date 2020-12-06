@@ -28,8 +28,9 @@ import scala.concurrent.duration._
 import com.google.common.io.Files
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.hadoop.yarn.server.MiniYARNCluster
-import org.scalatest.{BeforeAndAfterAll, Matchers}
+import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually._
+import org.scalatest.matchers.must.Matchers
 
 import org.apache.spark._
 import org.apache.spark.deploy.yarn.config._
@@ -63,7 +64,7 @@ abstract class BaseYarnClusterSuite
 
   def newYarnConfig(): YarnConfiguration
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     super.beforeAll()
 
     tempDir = Utils.createTempDir()
@@ -115,7 +116,7 @@ abstract class BaseYarnClusterSuite
     File.createTempFile("token", ".txt", hadoopConfDir)
   }
 
-  override def afterAll() {
+  override def afterAll(): Unit = {
     try {
       yarnCluster.stop()
     } finally {

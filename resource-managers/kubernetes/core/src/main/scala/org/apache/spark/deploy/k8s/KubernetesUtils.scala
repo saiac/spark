@@ -19,11 +19,11 @@ package org.apache.spark.deploy.k8s
 import java.io.{File, IOException}
 import java.net.URI
 import java.security.SecureRandom
-import java.util.UUID
+import java.util.{Collections, UUID}
 
 import scala.collection.JavaConverters._
 
-import io.fabric8.kubernetes.api.model.{Container, ContainerBuilder, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod, PodBuilder, Quantity, QuantityBuilder}
+import io.fabric8.kubernetes.api.model.{Container, ContainerBuilder, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, HasMetadata, OwnerReferenceBuilder, Pod, PodBuilder, Quantity}
 import io.fabric8.kubernetes.client.KubernetesClient
 import org.apache.commons.codec.binary.Hex
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -228,11 +228,13 @@ private[spark] object KubernetesUtils extends Logging {
       sparkConf: SparkConf): Map[String, Quantity] = {
     val requests = ResourceUtils.parseAllResourceRequests(sparkConf, componentName)
     requests.map { request =>
-      val vendorDomain = request.vendor.getOrElse(throw new SparkException("Resource: " +
-        s"${request.id.resourceName} was requested, but vendor was not specified."))
-      val quantity = new QuantityBuilder(false)
-        .withAmount(request.amount.toString)
-        .build()
+      val vendorDomain = if (request.vendor.isPresent()) {
+        request.vendor.get()
+      } else {
+        throw new SparkException(s"Resource: ${request.id.resourceName} was requested, " +
+          "but vendor was not specified.")
+      }
+      val quantity = new Quantity(request.amount.toString)
       (KubernetesConf.buildKubernetesResourceName(vendorDomain, request.id.resourceName), quantity)
     }.toMap
   }
@@ -259,12 +261,19 @@ private[spark] object KubernetesUtils extends Logging {
       isLocalDependency(Utils.resolveURI(resource))
   }
 
-  def renameMainAppResource(resource: String, conf: SparkConf): String = {
+  def renameMainAppResource(
+      resource: String,
+      conf: Option[SparkConf] = None,
+      shouldUploadLocal: Boolean): String = {
     if (isLocalAndResolvable(resource)) {
-      SparkLauncher.NO_RESOURCE
+      if (shouldUploadLocal) {
+        uploadFileUri(resource, conf)
+      } else {
+        SparkLauncher.NO_RESOURCE
+      }
     } else {
       resource
-   }
+    }
   }
 
   def uploadFileUri(uri: String, conf: Option[SparkConf] = None): String = {
@@ -319,6 +328,24 @@ private[spark] object KubernetesUtils extends Logging {
           .withServiceAccountName(account)
         .endSpec()
         .build()
+    }
+  }
+
+  // Add a OwnerReference to the given resources making the pod an owner of them so when
+  // the pod is deleted, the resources are garbage collected.
+  def addOwnerReference(pod: Pod, resources: Seq[HasMetadata]): Unit = {
+    if (pod != null) {
+      val reference = new OwnerReferenceBuilder()
+        .withName(pod.getMetadata.getName)
+        .withApiVersion(pod.getApiVersion)
+        .withUid(pod.getMetadata.getUid)
+        .withKind(pod.getKind)
+        .withController(true)
+        .build()
+      resources.foreach { resource =>
+        val originalMetadata = resource.getMetadata
+        originalMetadata.setOwnerReferences(Collections.singletonList(reference))
+      }
     }
   }
 }

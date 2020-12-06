@@ -27,8 +27,9 @@ import org.eclipse.jetty.servlet.ServletContextHandler
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
-import org.scalatest.Matchers
-import org.scalatest.mockito.MockitoSugar
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
+import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.internal.Logging

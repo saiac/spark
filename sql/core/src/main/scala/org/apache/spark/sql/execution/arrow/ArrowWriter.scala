@@ -62,6 +62,11 @@ object ArrowWriter {
       case (ArrayType(_, _), vector: ListVector) =>
         val elementVector = createFieldWriter(vector.getDataVector())
         new ArrayWriter(vector, elementVector)
+      case (MapType(_, _, _), vector: MapVector) =>
+        val structVector = vector.getDataVector.asInstanceOf[StructVector]
+        val keyWriter = createFieldWriter(structVector.getChild(MapVector.KEY_NAME))
+        val valueWriter = createFieldWriter(structVector.getChild(MapVector.VALUE_NAME))
+        new MapWriter(vector, structVector, keyWriter, valueWriter)
       case (StructType(_), vector: StructVector) =>
         val children = (0 until vector.size()).map { ordinal =>
           createFieldWriter(vector.getChildByOrdinal(ordinal))
@@ -326,11 +331,11 @@ private[arrow] class StructWriter(
   override def setValue(input: SpecializedGetters, ordinal: Int): Unit = {
     val struct = input.getStruct(ordinal, children.length)
     var i = 0
+    valueVector.setIndexDefined(count)
     while (i < struct.numFields) {
       children(i).write(struct, i)
       i += 1
     }
-    valueVector.setIndexDefined(count)
   }
 
   override def finish(): Unit = {
@@ -341,5 +346,42 @@ private[arrow] class StructWriter(
   override def reset(): Unit = {
     super.reset()
     children.foreach(_.reset())
+  }
+}
+
+private[arrow] class MapWriter(
+    val valueVector: MapVector,
+    val structVector: StructVector,
+    val keyWriter: ArrowFieldWriter,
+    val valueWriter: ArrowFieldWriter) extends ArrowFieldWriter {
+
+  override def setNull(): Unit = {}
+
+  override def setValue(input: SpecializedGetters, ordinal: Int): Unit = {
+    val map = input.getMap(ordinal)
+    valueVector.startNewValue(count)
+    val keys = map.keyArray()
+    val values = map.valueArray()
+    var i = 0
+    while (i <  map.numElements()) {
+      structVector.setIndexDefined(keyWriter.count)
+      keyWriter.write(keys, i)
+      valueWriter.write(values, i)
+      i += 1
+    }
+
+    valueVector.endValue(count, map.numElements())
+  }
+
+  override def finish(): Unit = {
+    super.finish()
+    keyWriter.finish()
+    valueWriter.finish()
+  }
+
+  override def reset(): Unit = {
+    super.reset()
+    keyWriter.reset()
+    valueWriter.reset()
   }
 }

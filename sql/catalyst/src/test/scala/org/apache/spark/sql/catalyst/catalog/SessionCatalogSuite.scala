@@ -17,13 +17,19 @@
 
 package org.apache.spark.sql.catalyst.catalog
 
+import scala.concurrent.duration._
+
+import org.scalatest.concurrent.Eventually
+
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.{AliasIdentifier, FunctionIdentifier, TableIdentifier}
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, QualifiedTableName, TableIdentifier}
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.plans.logical.{Range, SubqueryAlias, View}
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.catalyst.plans.logical.{Command, Range, SubqueryAlias, View}
+import org.apache.spark.sql.connector.catalog.CatalogManager
+import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
+import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.types._
 
 class InMemorySessionCatalogSuite extends SessionCatalogSuite {
@@ -43,7 +49,7 @@ class InMemorySessionCatalogSuite extends SessionCatalogSuite {
  * signatures but do not extend a common parent. This is largely by design but
  * unfortunately leads to very similar test code in two places.
  */
-abstract class SessionCatalogSuite extends AnalysisTest {
+abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
   protected val utils: CatalogTestUtils
 
   protected val isHiveExternalCatalog = false
@@ -61,6 +67,16 @@ abstract class SessionCatalogSuite extends AnalysisTest {
 
   private def withEmptyCatalog(f: SessionCatalog => Unit): Unit = {
     val catalog = new SessionCatalog(newEmptyCatalog())
+    catalog.createDatabase(newDb("default"), ignoreIfExists = true)
+    try {
+      f(catalog)
+    } finally {
+      catalog.reset()
+    }
+  }
+
+  private def withConfAndEmptyCatalog(conf: SQLConf)(f: SessionCatalog => Unit): Unit = {
+    val catalog = new SessionCatalog(newEmptyCatalog(), new SimpleFunctionRegistry(), conf)
     catalog.createDatabase(newDb("default"), ignoreIfExists = true)
     try {
       f(catalog)
@@ -87,7 +103,7 @@ abstract class SessionCatalogSuite extends AnalysisTest {
     }
   }
 
-  def testInvalidName(func: (String) => Unit) {
+  def testInvalidName(func: (String) => Unit): Unit = {
     // scalastyle:off
     // non ascii characters are not allowed in the source code, so we disable the scalastyle.
     val name = "砖"
@@ -207,8 +223,8 @@ abstract class SessionCatalogSuite extends AnalysisTest {
       // Note: alter properties here because Hive does not support altering other fields
       catalog.alterDatabase(db1.copy(properties = Map("k" -> "v3", "good" -> "true")))
       val newDb1 = catalog.getDatabaseMetadata("db1")
-      assert(db1.properties.isEmpty)
-      assert(newDb1.properties.size == 2)
+      assert((db1.properties -- Seq(PROP_OWNER)).isEmpty)
+      assert((newDb1.properties -- Seq(PROP_OWNER)).size == 2)
       assert(newDb1.properties.get("k") == Some("v3"))
       assert(newDb1.properties.get("good") == Some("true"))
     }
@@ -620,18 +636,40 @@ abstract class SessionCatalogSuite extends AnalysisTest {
 
   test("look up view relation") {
     withBasicCatalog { catalog =>
+      val props = CatalogTable.catalogAndNamespaceToProps("cat1", Seq("ns1"))
+      catalog.createTable(
+        newView("db3", "view1", props),
+        ignoreIfExists = false)
       val metadata = catalog.externalCatalog.getTable("db3", "view1")
-      catalog.setCurrentDatabase("default")
-      // Look up a view.
       assert(metadata.viewText.isDefined)
-      val view = View(desc = metadata, output = metadata.schema.toAttributes,
+      assert(metadata.viewCatalogAndNamespace == Seq("cat1", "ns1"))
+
+      // Look up a view.
+      catalog.setCurrentDatabase("default")
+      val view = View(desc = metadata, isTempView = false, output = metadata.schema.toAttributes,
         child = CatalystSqlParser.parsePlan(metadata.viewText.get))
       comparePlans(catalog.lookupRelation(TableIdentifier("view1", Some("db3"))),
-        SubqueryAlias("view1", "db3", view))
+        SubqueryAlias(Seq(CatalogManager.SESSION_CATALOG_NAME, "db3", "view1"), view))
       // Look up a view using current database of the session catalog.
       catalog.setCurrentDatabase("db3")
       comparePlans(catalog.lookupRelation(TableIdentifier("view1")),
-        SubqueryAlias("view1", "db3", view))
+        SubqueryAlias(Seq(CatalogManager.SESSION_CATALOG_NAME, "db3", "view1"), view))
+    }
+  }
+
+  test("look up view created before Spark 3.0") {
+    withBasicCatalog { catalog =>
+      val oldView = newView("db3", "view2", Map(CatalogTable.VIEW_DEFAULT_DATABASE -> "db2"))
+      catalog.createTable(oldView, ignoreIfExists = false)
+
+      val metadata = catalog.externalCatalog.getTable("db3", "view2")
+      assert(metadata.viewText.isDefined)
+      assert(metadata.viewCatalogAndNamespace == Seq(CatalogManager.SESSION_CATALOG_NAME, "db2"))
+
+      val view = View(desc = metadata, isTempView = false, output = metadata.schema.toAttributes,
+        child = CatalystSqlParser.parsePlan(metadata.viewText.get))
+      comparePlans(catalog.lookupRelation(TableIdentifier("view2", Some("db3"))),
+        SubqueryAlias(Seq(CatalogManager.SESSION_CATALOG_NAME, "db3", "view2"), view))
     }
   }
 
@@ -1429,7 +1467,7 @@ abstract class SessionCatalogSuite extends AnalysisTest {
         catalog.dropFunction(
           FunctionIdentifier("something", Some("unknown_db")), ignoreIfNotExists = false)
       }
-      intercept[NoSuchFunctionException] {
+      intercept[NoSuchPermanentFunctionException] {
         catalog.dropFunction(FunctionIdentifier("does_not_exist"), ignoreIfNotExists = false)
       }
       catalog.dropFunction(FunctionIdentifier("does_not_exist"), ignoreIfNotExists = true)
@@ -1580,26 +1618,28 @@ abstract class SessionCatalogSuite extends AnalysisTest {
     import org.apache.spark.sql.catalyst.dsl.plans._
 
     Seq(true, false) foreach { caseSensitive =>
-      val conf = new SQLConf().copy(SQLConf.CASE_SENSITIVE -> caseSensitive)
-      val catalog = new SessionCatalog(newBasicCatalog(), new SimpleFunctionRegistry, conf)
-      catalog.setCurrentDatabase("db1")
-      try {
-        val analyzer = new Analyzer(catalog, conf)
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive.toString) {
+        val catalog = new SessionCatalog(newBasicCatalog(), new SimpleFunctionRegistry)
+        catalog.setCurrentDatabase("db1")
+        try {
+          val analyzer = new Analyzer(catalog)
 
-        // The analyzer should report the undefined function rather than the undefined table first.
-        val cause = intercept[AnalysisException] {
-          analyzer.execute(
-            UnresolvedRelation(TableIdentifier("undefined_table")).select(
-              UnresolvedFunction("undefined_fn", Nil, isDistinct = false)
+          // The analyzer should report the undefined function
+          // rather than the undefined table first.
+          val cause = intercept[AnalysisException] {
+            analyzer.execute(
+              UnresolvedRelation(TableIdentifier("undefined_table")).select(
+                UnresolvedFunction("undefined_fn", Nil, isDistinct = false)
+              )
             )
-          )
-        }
+          }
 
-        assert(cause.getMessage.contains("Undefined function: 'undefined_fn'"))
-        // SPARK-21318: the error message should contains the current database name
-        assert(cause.getMessage.contains("db1"))
-      } finally {
-        catalog.reset()
+          assert(cause.getMessage.contains("Undefined function: 'undefined_fn'"))
+          // SPARK-21318: the error message should contains the current database name
+          assert(cause.getMessage.contains("db1"))
+        } finally {
+          catalog.reset()
+        }
       }
     }
   }
@@ -1615,6 +1655,29 @@ abstract class SessionCatalogSuite extends AnalysisTest {
       // override in `AnalysisException`,so here we get the root cause
       // exception message for check.
       assert(cause.cause.get.getMessage.contains("Actual error"))
+    }
+  }
+
+  test("expire table relation cache if TTL is configured") {
+    case class TestCommand() extends Command
+
+    val conf = new SQLConf()
+    conf.setConf(StaticSQLConf.METADATA_CACHE_TTL_SECONDS, 1L)
+
+    withConfAndEmptyCatalog(conf) { catalog =>
+      val table = QualifiedTableName(catalog.getCurrentDatabase, "test")
+
+      // First, make sure the test table is not cached.
+      assert(catalog.getCachedTable(table) === null)
+
+      catalog.cacheTable(table, TestCommand())
+      assert(catalog.getCachedTable(table) !== null)
+
+      // Wait until the cache expiration.
+      eventually(timeout(3.seconds)) {
+        // And the cache is gone.
+        assert(catalog.getCachedTable(table) === null)
+      }
     }
   }
 }

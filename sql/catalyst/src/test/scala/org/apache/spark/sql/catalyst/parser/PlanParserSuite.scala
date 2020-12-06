@@ -55,6 +55,109 @@ class PlanParserSuite extends AnalysisTest {
     With(plan, ctes)
   }
 
+  test("single comment case one") {
+    val plan = table("a").select(star())
+    assertEqual("-- single comment\nSELECT * FROM a", plan)
+  }
+
+  test("single comment case two") {
+    val plan = table("a").select(star())
+    assertEqual("-- single comment\\\nwith line continuity\nSELECT * FROM a", plan)
+  }
+
+  test("bracketed comment case one") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/* This is an example of SQL which should not execute:
+        | * select 'multi-line';
+        | */
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("bracketed comment case two") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*
+        |SELECT 'trailing' as x1; -- inside block comment
+        |*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case one") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/* This block comment surrounds a query which itself has a block comment...
+        |SELECT /* embedded single line */ 'embedded' AS x2;
+        |*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case two") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |SELECT -- continued after the following block comments...
+        |/* Deeply nested comment.
+        |   This includes a single apostrophe to make sure we aren't decoding this part as a string.
+        |SELECT 'deep nest' AS n1;
+        |/* Second level of nesting...
+        |SELECT 'deeper nest' as n2;
+        |/* Third level of nesting...
+        |SELECT 'deepest nest' as n3;
+        |*/
+        |Hoo boy. Still two deep...
+        |*/
+        |Now just one deep...
+        |*/
+        |* FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case three") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/* This block comment surrounds a query which itself has a block comment...
+        |//* I am a nested bracketed comment.
+        |*/
+        |*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case four") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*/**/*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case five") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*/*abc*/*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case six") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*/*foo*//*bar*/*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
   test("case insensitive") {
     val plan = table("a").select(star())
     assertEqual("sELEct * FroM a", plan)
@@ -110,7 +213,7 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual("select a, b from db.c where x < 1", table("db", "c").where('x < 1).select('a, 'b))
     assertEqual(
       "select a, b from db.c having x < 1",
-      table("db", "c").groupBy()('a, 'b).where('x < 1))
+      table("db", "c").having()('a, 'b)('x < 1))
     assertEqual("select distinct a, b from db.c", Distinct(table("db", "c").select('a, 'b)))
     assertEqual("select all a, b from db.c", table("db", "c").select('a, 'b))
     assertEqual("select from tbl", OneRowRelation().select('from.as("tbl")))
@@ -184,13 +287,15 @@ class PlanParserSuite extends AnalysisTest {
   }
 
   test("insert into") {
+    import org.apache.spark.sql.catalyst.dsl.expressions._
+    import org.apache.spark.sql.catalyst.dsl.plans._
     val sql = "select * from t"
     val plan = table("t").select(star())
     def insert(
         partition: Map[String, Option[String]],
         overwrite: Boolean = false,
         ifPartitionNotExists: Boolean = false): LogicalPlan =
-      InsertIntoTable(table("s"), partition, plan, overwrite, ifPartitionNotExists)
+      InsertIntoStatement(table("s"), partition, Nil, plan, overwrite, ifPartitionNotExists)
 
     // Single inserts
     assertEqual(s"insert overwrite table s $sql",
@@ -205,17 +310,7 @@ class PlanParserSuite extends AnalysisTest {
     // Multi insert
     val plan2 = table("t").where('x > 5).select(star())
     assertEqual("from t insert into s select * limit 1 insert into u select * where x > 5",
-      InsertIntoTable(
-        table("s"), Map.empty, plan.limit(1), false, ifPartitionNotExists = false).union(
-        InsertIntoTable(
-          table("u"), Map.empty, plan2, false, ifPartitionNotExists = false)))
-  }
-
-  test ("insert with if not exists") {
-    val sql = "select * from t"
-    intercept(s"insert overwrite table s partition (e = 1, x) if not exists $sql",
-      "Dynamic partitions do not support IF NOT EXISTS. Specified partitions with value: [x]")
-    intercept[ParseException](parsePlan(s"insert overwrite table s if not exists $sql"))
+      plan.limit(1).insertInto("s").union(plan2.insertInto("u")))
   }
 
   test("aggregation") {
@@ -484,8 +579,7 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual(
       "select g from t group by g having a > (select b from s)",
       table("t")
-        .groupBy('g)('g)
-        .where('a > ScalarSubquery(table("s").select('b))))
+        .having('g)('g)('a > ScalarSubquery(table("s").select('b))))
   }
 
   test("table reference") {
@@ -619,7 +713,7 @@ class PlanParserSuite extends AnalysisTest {
     comparePlans(
       parsePlan(
         "INSERT INTO s SELECT /*+ REPARTITION(100), COALESCE(500), COALESCE(10) */ * FROM t"),
-      InsertIntoTable(table("s"), Map.empty,
+      InsertIntoStatement(table("s"), Map.empty, Nil,
         UnresolvedHint("REPARTITION", Seq(Literal(100)),
           UnresolvedHint("COALESCE", Seq(Literal(500)),
             UnresolvedHint("COALESCE", Seq(Literal(10)),
@@ -632,6 +726,52 @@ class PlanParserSuite extends AnalysisTest {
           table("t").select(star()))))
 
     intercept("SELECT /*+ COALESCE(30 + 50) */ * FROM t", "mismatched input")
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(c) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(UnresolvedAttribute("c")),
+        table("t").select(star())))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(100, c) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        table("t").select(star())))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(100, c), COALESCE(50) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        UnresolvedHint("COALESCE", Seq(Literal(50)),
+          table("t").select(star()))))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(100, c), BROADCASTJOIN(u), COALESCE(50) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        UnresolvedHint("BROADCASTJOIN", Seq($"u"),
+          UnresolvedHint("COALESCE", Seq(Literal(50)),
+            table("t").select(star())))))
+
+    comparePlans(
+      parsePlan(
+        """
+          |SELECT
+          |/*+ REPARTITION(100, c), BROADCASTJOIN(u), COALESCE(50), REPARTITION(300, c) */
+          |* FROM t
+        """.stripMargin),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        UnresolvedHint("BROADCASTJOIN", Seq($"u"),
+          UnresolvedHint("COALESCE", Seq(Literal(50)),
+            UnresolvedHint("REPARTITION", Seq(Literal(300), UnresolvedAttribute("c")),
+              table("t").select(star()))))))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION_BY_RANGE(c) */ * FROM t"),
+      UnresolvedHint("REPARTITION_BY_RANGE", Seq(UnresolvedAttribute("c")),
+        table("t").select(star())))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION_BY_RANGE(100, c) */ * FROM t"),
+      UnresolvedHint("REPARTITION_BY_RANGE", Seq(Literal(100), UnresolvedAttribute("c")),
+        table("t").select(star())))
   }
 
   test("SPARK-20854: select hint syntax with expressions") {
@@ -883,5 +1023,12 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual(
       "WITH t(x) AS (SELECT c FROM a) SELECT * FROM t",
       cte(table("t").select(star()), "t" -> ((table("a").select('c), Seq("x")))))
+  }
+
+  test("statement containing terminal semicolons") {
+    assertEqual("select 1;", OneRowRelation().select(1))
+    assertEqual("select a, b;", OneRowRelation().select('a, 'b))
+    assertEqual("select a, b from db.c;;;", table("db", "c").select('a, 'b))
+    assertEqual("select a, b from db.c; ;;  ;", table("db", "c").select('a, 'b))
   }
 }

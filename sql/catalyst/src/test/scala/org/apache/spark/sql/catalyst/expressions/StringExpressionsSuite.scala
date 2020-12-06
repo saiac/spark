@@ -19,6 +19,8 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
@@ -154,6 +156,11 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(c1 endsWith "b", false, row)
     checkEvaluation(c2 endsWith "b", null, row)
     checkEvaluation(c1 endsWith Literal.create(null, StringType), null, row)
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(Contains(Literal("\"quote"), Literal("\"quote")) :: Nil)
+    GenerateUnsafeProjection.generate(EndsWith(Literal("\"quote"), Literal("\"quote")) :: Nil)
+    GenerateUnsafeProjection.generate(StartsWith(Literal("\"quote"), Literal("\"quote")) :: Nil)
   }
 
   test("Substring") {
@@ -228,6 +235,10 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       Substring(s, Literal.create(2, IntegerType), Literal.create(Integer.MAX_VALUE, IntegerType)),
       "xample",
       row)
+
+    // Substring with from negative position with negative length
+    checkEvaluation(Substring(s, Literal.create(-1207959552, IntegerType),
+      Literal.create(-1207959552, IntegerType)), "", row)
 
     val s_notNull = 'a.string.notNull.at(0)
 
@@ -351,6 +362,10 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(Decode(b, Literal("utf-8")), null, create_row(null))
     checkEvaluation(Decode(Literal.create(null, BinaryType), Literal("utf-8")), null)
     checkEvaluation(Decode(b, Literal.create(null, StringType)), null, create_row(null))
+
+    // Test escaping of charset
+    GenerateUnsafeProjection.generate(Encode(a, Literal("\"quote")) :: Nil)
+    GenerateUnsafeProjection.generate(Decode(b, Literal("\"quote")) :: Nil)
   }
 
   test("initcap unit test") {
@@ -378,6 +393,9 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(Levenshtein(Literal("千世"), Literal("fog")), 3)
     checkEvaluation(Levenshtein(Literal("世界千世"), Literal("大a界b")), 4)
     // scalastyle:on
+
+    // Test escaping of arguments:
+    GenerateUnsafeProjection.generate(Levenshtein(Literal("\"quotea"), Literal("\"quoteb")) :: Nil)
   }
 
   test("soundex unit test") {
@@ -428,7 +446,7 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     // scalastyle:on
   }
 
-  test("overlay") {
+  test("overlay for string") {
     checkEvaluation(new Overlay(Literal("Spark SQL"), Literal("_"),
       Literal.create(6, IntegerType)), "Spark_SQL")
     checkEvaluation(new Overlay(Literal("Spark SQL"), Literal("CORE"),
@@ -450,6 +468,75 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(new Overlay(Literal("Spark的SQL"), Literal("_"),
       Literal.create(6, IntegerType)), "Spark_SQL")
     // scalastyle:on
+    // position greater than the length of input string
+    checkEvaluation(new Overlay(Literal("Spark SQL"), Literal("_"),
+      Literal.create(10, IntegerType)), "Spark SQL_")
+    checkEvaluation(Overlay(Literal("Spark SQL"), Literal("_"),
+      Literal.create(10, IntegerType), Literal.create(4, IntegerType)), "Spark SQL_")
+    // position is zero
+    checkEvaluation(new Overlay(Literal("Spark SQL"), Literal("__"),
+      Literal.create(0, IntegerType)), "__park SQL")
+    checkEvaluation(Overlay(Literal("Spark SQL"), Literal("__"),
+      Literal.create(0, IntegerType), Literal.create(4, IntegerType)), "__rk SQL")
+    // position is negative
+    checkEvaluation(new Overlay(Literal("Spark SQL"), Literal("__"),
+      Literal.create(-10, IntegerType)), "__park SQL")
+    checkEvaluation(Overlay(Literal("Spark SQL"), Literal("__"),
+      Literal.create(-10, IntegerType), Literal.create(4, IntegerType)), "__rk SQL")
+  }
+
+  test("overlay for byte array") {
+    val input = Literal(Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9))
+    checkEvaluation(new Overlay(input, Literal(Array[Byte](-1)),
+      Literal.create(6, IntegerType)), Array[Byte](1, 2, 3, 4, 5, -1, 7, 8, 9))
+    checkEvaluation(new Overlay(input, Literal(Array[Byte](-1, -1, -1, -1)),
+      Literal.create(7, IntegerType)), Array[Byte](1, 2, 3, 4, 5, 6, -1, -1, -1, -1))
+    checkEvaluation(Overlay(input, Literal(Array[Byte](-1, -1)), Literal.create(7, IntegerType),
+      Literal.create(0, IntegerType)), Array[Byte](1, 2, 3, 4, 5, 6, -1, -1, 7, 8, 9))
+    checkEvaluation(Overlay(input, Literal(Array[Byte](-1, -1, -1, -1, -1)),
+      Literal.create(2, IntegerType), Literal.create(4, IntegerType)),
+      Array[Byte](1, -1, -1, -1, -1, -1, 6, 7, 8, 9))
+
+    val nullInput = Literal.create(null, BinaryType)
+    checkEvaluation(new Overlay(nullInput, Literal(Array[Byte](-1)),
+      Literal.create(6, IntegerType)), null)
+    checkEvaluation(new Overlay(nullInput, Literal(Array[Byte](-1, -1, -1, -1)),
+      Literal.create(7, IntegerType)), null)
+    checkEvaluation(Overlay(nullInput, Literal(Array[Byte](-1, -1)),
+      Literal.create(7, IntegerType), Literal.create(0, IntegerType)), null)
+    checkEvaluation(Overlay(nullInput, Literal(Array[Byte](-1, -1, -1, -1, -1)),
+      Literal.create(2, IntegerType), Literal.create(4, IntegerType)), null)
+    // position greater than the length of input byte array
+    checkEvaluation(new Overlay(input, Literal(Array[Byte](-1)),
+      Literal.create(10, IntegerType)), Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9, -1))
+    checkEvaluation(Overlay(input, Literal(Array[Byte](-1)), Literal.create(10, IntegerType),
+      Literal.create(4, IntegerType)), Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9, -1))
+    // position is zero
+    checkEvaluation(new Overlay(input, Literal(Array[Byte](-1, -1)),
+      Literal.create(0, IntegerType)), Array[Byte](-1, -1, 2, 3, 4, 5, 6, 7, 8, 9))
+    checkEvaluation(Overlay(input, Literal(Array[Byte](-1, -1)), Literal.create(0, IntegerType),
+      Literal.create(4, IntegerType)), Array[Byte](-1, -1, 4, 5, 6, 7, 8, 9))
+    // position is negative
+    checkEvaluation(new Overlay(input, Literal(Array[Byte](-1, -1)),
+      Literal.create(-10, IntegerType)), Array[Byte](-1, -1, 2, 3, 4, 5, 6, 7, 8, 9))
+    checkEvaluation(Overlay(input, Literal(Array[Byte](-1, -1)), Literal.create(-10, IntegerType),
+      Literal.create(4, IntegerType)), Array[Byte](-1, -1, 4, 5, 6, 7, 8, 9))
+  }
+
+  test("Check Overlay.checkInputDataTypes results") {
+    assert(new Overlay(Literal("Spark SQL"), Literal("_"),
+      Literal.create(6, IntegerType)).checkInputDataTypes().isSuccess)
+    assert(Overlay(Literal("Spark SQL"), Literal("ANSI "), Literal.create(7, IntegerType),
+      Literal.create(0, IntegerType)).checkInputDataTypes().isSuccess)
+    assert(new Overlay(Literal.create("Spark SQL".getBytes), Literal.create("_".getBytes),
+      Literal.create(6, IntegerType)).checkInputDataTypes().isSuccess)
+    assert(Overlay(Literal.create("Spark SQL".getBytes), Literal.create("ANSI ".getBytes),
+      Literal.create(7, IntegerType), Literal.create(0, IntegerType))
+      .checkInputDataTypes().isSuccess)
+    assert(new Overlay(Literal.create(1), Literal.create(2), Literal.create(0, IntegerType))
+      .checkInputDataTypes().isFailure)
+    assert(Overlay(Literal("Spark SQL"), Literal.create(2), Literal.create(7, IntegerType),
+      Literal.create(0, IntegerType)).checkInputDataTypes().isFailure)
   }
 
   test("translate") {
@@ -490,6 +577,9 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(StringTrim(Literal("a"), Literal.create(null, StringType)), null)
     checkEvaluation(StringTrim(Literal.create(null, StringType), Literal("a")), null)
 
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(StringTrim(Literal("\"quote"), Literal("\"quote")) :: Nil)
+
     checkEvaluation(StringTrim(Literal("yxTomxx"), Literal("xyz")), "Tom")
     checkEvaluation(StringTrim(Literal("xxxbarxxx"), Literal("x")), "bar")
   }
@@ -516,6 +606,10 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     // scalastyle:on
     checkEvaluation(StringTrimLeft(Literal.create(null, StringType), Literal("a")), null)
     checkEvaluation(StringTrimLeft(Literal("a"), Literal.create(null, StringType)), null)
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(
+      StringTrimLeft(Literal("\"quote"), Literal("\"quote")) :: Nil)
 
     checkEvaluation(StringTrimLeft(Literal("zzzytest"), Literal("xyz")), "test")
     checkEvaluation(StringTrimLeft(Literal("zzzytestxyz"), Literal("xyz")), "testxyz")
@@ -546,6 +640,10 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(StringTrimRight(Literal("a"), Literal.create(null, StringType)), null)
     checkEvaluation(StringTrimRight(Literal.create(null, StringType), Literal("a")), null)
 
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(
+      StringTrimRight(Literal("\"quote"), Literal("\"quote")) :: Nil)
+
     checkEvaluation(StringTrimRight(Literal("testxxzx"), Literal("xyz")), "test")
     checkEvaluation(StringTrimRight(Literal("xyztestxxzx"), Literal("xyz")), "xyztest")
     checkEvaluation(StringTrimRight(Literal("TURNERyxXxy"), Literal("xy")), "TURNERyxX")
@@ -562,6 +660,9 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       FormatString(Literal("aa%d%s"), Literal.create(null, IntegerType), "cc"), "aanullcc")
     checkEvaluation(
       FormatString(Literal("aa%d%s"), 12, Literal.create(null, StringType)), "aa12null")
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(FormatString(Literal("\"quote"), Literal("\"quote")) :: Nil)
   }
 
   test("SPARK-22603: FormatString should not generate codes beyond 64KB") {
@@ -592,6 +693,9 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(StringInstr(s1, s2), 1, create_row("花花世界", "花"))
     checkEvaluation(StringInstr(s1, s2), 0, create_row("花花世界", "小"))
     // scalastyle:on
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(StringInstr(Literal("\"quote"), Literal("\"quote")) :: Nil)
   }
 
   test("LOCATE") {
@@ -648,6 +752,10 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(StringRPad(s1, s2, s3), null, row3)
     checkEvaluation(StringRPad(s1, s2, s3), null, row4)
     checkEvaluation(StringRPad(s1, s2, s3), null, row5)
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(StringLPad(Literal("\"quote"), s2, Literal("\"quote")) :: Nil)
+    GenerateUnsafeProjection.generate(StringRPad(Literal("\"quote"), s2, Literal("\"quote")) :: Nil)
     checkEvaluation(StringRPad(Literal("hi"), Literal(5)), "hi   ")
     checkEvaluation(StringRPad(Literal("hi"), Literal(1)), "h")
   }
@@ -662,6 +770,9 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(StringRepeat(Literal("hi"), Literal(-1)), "", row1)
     checkEvaluation(StringRepeat(s1, s2), "hihi", row1)
     checkEvaluation(StringRepeat(s1, s2), null, row2)
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(StringRepeat(Literal("\"quote"), Literal(2)) :: Nil)
   }
 
   test("REVERSE") {
@@ -827,6 +938,23 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(ParseUrl(Seq(Literal("1"), Literal(2))).checkInputDataTypes().isFailure)
     assert(ParseUrl(Seq(Literal(1), Literal("2"))).checkInputDataTypes().isFailure)
     assert(ParseUrl(Seq(Literal("1"), Literal("2"), Literal(3))).checkInputDataTypes().isFailure)
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(ParseUrl(Seq(Literal("\"quote"), Literal("\"quote"))) :: Nil)
+  }
+
+  test("SPARK-33468: ParseUrl in ANSI mode should fail if input string is not a valid url") {
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      val msg = intercept[IllegalArgumentException] {
+        evaluateWithoutCodegen(
+          ParseUrl(Seq("https://a.b.c/index.php?params1=a|b&params2=x", "HOST")))
+      }.getMessage
+      assert(msg.contains("Find an invaild url string"))
+    }
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      checkEvaluation(
+        ParseUrl(Seq("https://a.b.c/index.php?params1=a|b&params2=x", "HOST")), null)
+    }
   }
 
   test("Sentences") {
@@ -849,5 +977,39 @@ class StringExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       answer)
     checkEvaluation(Sentences("Hi there! The price was $1,234.56.... But, not now.", "XXX", "YYY"),
       answer)
+
+    // Test escaping of arguments
+    GenerateUnsafeProjection.generate(
+      Sentences(Literal("\"quote"), Literal("\"quote"), Literal("\"quote")) :: Nil)
+  }
+
+  test("SPARK-33386: elt ArrayIndexOutOfBoundsException") {
+    Seq(true, false).foreach { ansiEnabled =>
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString) {
+        var expr: Expression = Elt(Seq(Literal(4), Literal("123"), Literal("456")))
+        if (ansiEnabled) {
+          val errMsg = "Invalid index: 4, numElements: 2"
+          checkExceptionInExpression[Exception](expr, errMsg)
+        } else {
+          checkEvaluation(expr, null)
+        }
+
+        expr = Elt(Seq(Literal(0), Literal("123"), Literal("456")))
+        if (ansiEnabled) {
+          val errMsg = "Invalid index: 0, numElements: 2"
+          checkExceptionInExpression[Exception](expr, errMsg)
+        } else {
+          checkEvaluation(expr, null)
+        }
+
+        expr = Elt(Seq(Literal(-1), Literal("123"), Literal("456")))
+        if (ansiEnabled) {
+          val errMsg = "Invalid index: -1, numElements: 2"
+          checkExceptionInExpression[Exception](expr, errMsg)
+        } else {
+          checkEvaluation(expr, null)
+        }
+      }
+    }
   }
 }

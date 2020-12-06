@@ -25,7 +25,6 @@ import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.types.IntegerType
-import org.apache.spark.unsafe.types.CalendarInterval
 
 class LeftSemiPushdownSuite extends PlanTest {
 
@@ -314,6 +313,21 @@ class LeftSemiPushdownSuite extends PlanTest {
 
     val optimized = Optimize.execute(originalQuery.analyze)
     comparePlans(optimized, originalQuery.analyze)
+  }
+
+  test("Unary: LeftSemi join push down through Expand") {
+    val expand = Expand(Seq(Seq('a, 'b, "null"), Seq('a, "null", 'c)),
+      Seq('a, 'b, 'c), testRelation)
+    val originalQuery = expand
+      .join(testRelation1, joinType = LeftSemi, condition = Some('b === 'd && 'b === 1))
+
+    val optimized = Optimize.execute(originalQuery.analyze)
+    val correctAnswer = Expand(Seq(Seq('a, 'b, "null"), Seq('a, "null", 'c)),
+      Seq('a, 'b, 'c), testRelation
+        .join(testRelation1, joinType = LeftSemi, condition = Some('b === 'd && 'b === 1)))
+      .analyze
+
+    comparePlans(optimized, correctAnswer)
   }
 
   Seq(Some('d === 'e), None).foreach { case innerJoinCond =>

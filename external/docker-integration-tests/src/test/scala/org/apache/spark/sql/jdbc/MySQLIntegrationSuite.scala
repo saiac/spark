@@ -21,13 +21,21 @@ import java.math.BigDecimal
 import java.sql.{Connection, Date, Timestamp}
 import java.util.Properties
 
-import org.apache.spark.sql.{Row, SaveMode}
+import org.apache.spark.sql.Row
 import org.apache.spark.tags.DockerTest
 
+/**
+ * To run this test suite for a specific version (e.g., mysql:5.7.31):
+ * {{{
+ *   MYSQL_DOCKER_IMAGE_NAME=mysql:5.7.31
+ *     ./build/sbt -Pdocker-integration-tests
+ *     "testOnly org.apache.spark.sql.jdbc.MySQLIntegrationSuite"
+ * }}}
+ */
 @DockerTest
 class MySQLIntegrationSuite extends DockerJDBCIntegrationSuite {
   override val db = new DatabaseOnDocker {
-    override val imageName = "mysql:5.7.9"
+    override val imageName = sys.env.getOrElse("MYSQL_DOCKER_IMAGE_NAME", "mysql:5.7.31")
     override val env = Map(
       "MYSQL_ROOT_PASSWORD" -> "rootpass"
     )
@@ -35,10 +43,11 @@ class MySQLIntegrationSuite extends DockerJDBCIntegrationSuite {
     override val jdbcPort: Int = 3306
     override def getJdbcUrl(ip: String, port: Int): String =
       s"jdbc:mysql://$ip:$port/mysql?user=root&password=rootpass"
-    override def getStartupProcessName: Option[String] = None
   }
 
   override def dataPreparation(conn: Connection): Unit = {
+    // Since MySQL 5.7.14+, we need to disable strict mode
+    conn.prepareStatement("SET GLOBAL sql_mode = ''").executeUpdate()
     conn.prepareStatement("CREATE DATABASE foo").executeUpdate()
     conn.prepareStatement("CREATE TABLE tbl (x INTEGER, y TEXT(8))").executeUpdate()
     conn.prepareStatement("INSERT INTO tbl VALUES (42,'fred')").executeUpdate()

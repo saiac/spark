@@ -20,10 +20,9 @@ package org.apache.spark.sql.catalyst.analysis
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, View}
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.internal.SQLConf
 
 /**
- * This file defines analysis rules related to views.
+ * This file defines view types and analysis rules related to views.
  */
 
 /**
@@ -54,12 +53,10 @@ import org.apache.spark.sql.internal.SQLConf
  * completely resolved during the batch of Resolution.
  */
 object EliminateView extends Rule[LogicalPlan] with CastSupport {
-  override def conf: SQLConf = SQLConf.get
-
   override def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
     // The child has the different output attributes with the View operator. Adds a Project over
     // the child of the view.
-    case v @ View(desc, output, child) if child.resolved && !v.sameOutput(child) =>
+    case v @ View(desc, _, output, child) if child.resolved && !v.sameOutput(child) =>
       val resolver = conf.resolver
       val queryColumnNames = desc.viewQueryColumnNames
       val queryOutput = if (queryColumnNames.nonEmpty) {
@@ -86,7 +83,40 @@ object EliminateView extends Rule[LogicalPlan] with CastSupport {
 
     // The child should have the same output attributes with the View operator, so we simply
     // remove the View operator.
-    case View(_, _, child) =>
+    case View(_, _, _, child) =>
       child
   }
 }
+
+/**
+ * ViewType is used to specify the expected view type when we want to create or replace a view in
+ * [[CreateViewStatement]].
+ */
+sealed trait ViewType {
+  override def toString: String = getClass.getSimpleName.stripSuffix("$")
+}
+
+/**
+ * LocalTempView means session-scoped local temporary views. Its lifetime is the lifetime of the
+ * session that created it, i.e. it will be automatically dropped when the session terminates. It's
+ * not tied to any databases, i.e. we can't use `db1.view1` to reference a local temporary view.
+ */
+object LocalTempView extends ViewType
+
+/**
+ * GlobalTempView means cross-session global temporary views. Its lifetime is the lifetime of the
+ * Spark application, i.e. it will be automatically dropped when the application terminates. It's
+ * tied to a system preserved database `global_temp`, and we must use the qualified name to refer a
+ * global temp view, e.g. SELECT * FROM global_temp.view1.
+ */
+object GlobalTempView extends ViewType
+
+/**
+ * PersistedView means cross-session persisted views. Persisted views stay until they are
+ * explicitly dropped by user command. It's always tied to a database, default to the current
+ * database if not specified.
+ *
+ * Note that, Existing persisted view with the same name are not visible to the current session
+ * while the local temporary view exists, unless the view name is qualified by database.
+ */
+object PersistedView extends ViewType

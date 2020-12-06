@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.expressions.codegen
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.types.{BooleanType, IntegerType}
+import org.apache.spark.sql.types.IntegerType
 
 class CodeBlockSuite extends SparkFunSuite {
 
@@ -35,6 +35,18 @@ class CodeBlockSuite extends SparkFunSuite {
     val intLiteral = 1
     val code = code"int $value = $intLiteral;"
     assert(code.asInstanceOf[CodeBlock].blockInputs === Seq(value))
+  }
+
+  test("Code parts should be treated for escapes, but string inputs shouldn't be") {
+    val strlit = raw"\\"
+    val code = code"""String s = "foo\\bar" + "$strlit";"""
+
+    val builtin = s"""String s = "foo\\bar" + "$strlit";"""
+
+    val expected = raw"""String s = "foo\bar" + "\\";"""
+
+    assert(builtin == expected)
+    assert(code.asInstanceOf[CodeBlock].toString == expected)
   }
 
   test("Block.stripMargin") {
